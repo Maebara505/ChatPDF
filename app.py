@@ -2,6 +2,7 @@ import streamlit as st
 import os
 import hashlib
 import chromadb
+import docx  # para word xd
 import google.generativeai as genai
 
 from pypdf import PdfReader
@@ -11,15 +12,13 @@ from dotenv import load_dotenv
 # ============================================================
 # CONFIGURACIÓN GENERAL
 # ============================================================
-st.set_page_config(page_title="Chat PDF con Gemini")
+st.set_page_config(page_title="Chat PDF/Word con Gemini")
 
-# Carga variables de entorno desde .env
-# Aquí se espera GOOGLE_API_KEY=xxxx
+# Carga variables de entorno
 load_dotenv()
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 
 # Modelo de embeddings local
-# Se puede cambiar por otros modelos de sentence-transformers
 EMBEDDING_MODEL = SentenceTransformer("all-MiniLM-L6-v2")
 
 # Se Inicializa el Cliente de ChromaDB
@@ -28,205 +27,100 @@ client = chromadb.Client()
 # ============================================================
 # SESSION STATE
 # ============================================================
-# session_state nos permite "recordar" cosas entre reruns.
 if "collection" not in st.session_state:
     st.session_state.collection = None
 
-if "pdf_processed" not in st.session_state:
-    st.session_state.pdf_processed = False
+if "file_processed" not in st.session_state:
+    st.session_state.file_processed = False
 
-if "pdf_hash" not in st.session_state:
-    st.session_state.pdf_hash = None
+if "file_hash" not in st.session_state:
+    st.session_state.file_hash = None
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []  # Para guardar el historial del chat
 
 # ============================================================
 # FUNCIONES
 # ============================================================
-def hash_pdf(file) -> str:
+def hash_file(file) -> str:
     return hashlib.sha256(file.getvalue()).hexdigest()
 
 def extract_text_from_pdf(pdf_file):
-    """
-    Extrae texto de un PDF digital (no escaneado).
-    Incluye el número de página como marcador.
-    """
+    """Extrae texto de un PDF digital."""
     reader = PdfReader(pdf_file)
     text = ""
-
     for i, page in enumerate(reader.pages):
         content = page.extract_text()
         if content:
             text += f"\n[Página {i+1}]\n{content}"
-
     return text
 
+def extract_text_from_docx(docx_file):
+    """Extrae texto de un archivo Word (.docx)."""
+    doc = docx.Document(docx_file)
+    all_text = []
+    for para in doc.paragraphs:
+        all_text.append(para.text)
+    return "\n".join(all_text)
 
 def chunk_text(text):
-    """
-    Divide un texto largo en fragmentos (chunks) con solapamiento.
-
-    chunk_size:
-        - Número máximo de caracteres por fragmento
-        - Valores típicos: 400–800
-        - Más grande = más contexto, pero embeddings más caros
-
-    overlap:
-        - Número de caracteres que se repiten entre chunks consecutivos
-        - Evita que una idea quede cortada entre fragmentos
-        - Regla común: 10–20% del chunk_size
-
-    Devuelve:
-        Lista de diccionarios, cada uno representando un chunk con:
-        - id           -> identificador único
-        - content      -> texto del fragmento
-        - start_index  -> posición donde comienza en el texto original
-        - size         -> longitud real del chunk
-    """
+    """Divide un texto largo en fragmentos (chunks)."""
     chunk_size = 500 
     overlap = 100
-    chunks = []          # Aquí guardaremos todos los fragmentos
-    start = 0            # Puntero que indica desde dónde empezamos a cortar
-    chunk_id = 0         # Contador para asignar IDs únicos
+    chunks = []
+    start = 0
+    chunk_id = 0
 
-    # El while se ejecuta mientras NO hayamos llegado al final del texto
     while start < len(text):
-
-        # 1️⃣ Cortamos el texto desde 'start' hasta 'start + chunk_size'
-        #    Python corta automáticamente si se pasa del largo del texto
         chunk_text = text[start:start + chunk_size]
-
-        # 2️⃣ Guardamos el chunk junto con metadata útil
         chunks.append({
-            "id": f"chunk_{chunk_id}",   # Identificador único del fragmento
-            "content": chunk_text,       # Texto real del fragmento
-            "start_index": start,        # Posición en el texto original
-            "size": len(chunk_text)      # Tamaño real del fragmento
+            "id": f"chunk_{chunk_id}",
+            "content": chunk_text,
+            "start_index": start,
+            "size": len(chunk_text)
         })
-
-        # 3️⃣ Incrementamos el ID para el próximo chunk
         chunk_id += 1
-
-        # 4️⃣ Avanzamos el puntero 'start'
-        #    No avanzamos chunk_size completo,
-        #    sino (chunk_size - overlap) para que haya solapamiento
-        #
-        #    Ejemplo:
-        #    chunk_size = 500
-        #    overlap    = 100
-        #    start avanza 400 caracteres
-        #
-        #    Los últimos 100 caracteres del chunk actual
-        #    aparecerán también al inicio del siguiente
         start += chunk_size - overlap
-
-    # 5️⃣ Cuando start >= len(text), el while termina
-    #    y devolvemos todos los fragmentos creados
     return chunks
 
-
-
 def create_chroma_collection(chunks):
-    """
-    Crea una colección nueva en ChromaDB a partir de los chunks generados.
-
-    Cada chunk se almacena junto con:
-    - su embedding (vector numérico)
-    - su texto original
-    - metadata útil
-    """
-
-    # ------------------------------
-    # 1️⃣ Borrado defensivo
-    # ------------------------------
-    # Si ya existe una colección con el mismo nombre ("pdf_rag"),
+    """Crea una colección nueva en ChromaDB."""
     try:
-        client.delete_collection("pdf_rag")
+        client.delete_collection("doc_rag") # Cambié nombre para evitar conflictos
     except:
-        # Si la colección no existe, Chroma lanza error.
-        # Lo ignoramos porque es un caso esperado.
         pass
 
-    # ------------------------------
-    # 2️⃣ Crear colección nueva
-    # ------------------------------
-    # Aquí Chroma crea:
-    # - una tabla de documentos
-    # - un índice vectorial
-    # - espacio para metadatos
-    collection = client.create_collection(name="pdf_rag")
-
-    # ------------------------------
-    # 3️⃣ Separar texto de metadata
-    # ------------------------------
-    # Extraemos SOLO el contenido textual de cada chunk.
-    # Esto es lo que se convertirá en embeddings.
+    collection = client.create_collection(name="doc_rag")
     texts = [c["content"] for c in chunks]
-
-    # ------------------------------
-    # 4️⃣ Generar embeddings
-    # ------------------------------
-    # El modelo de SentenceTransformers convierte cada texto
-    # en un vector numérico.
-    #
-    # Cada vector representa el significado del chunk.
     embeddings = EMBEDDING_MODEL.encode(texts)
 
-    # ------------------------------
-    # 5️⃣ Insertar datos en Chroma
-    # ------------------------------
     collection.add(
-        # Texto original del chunk
         documents=texts,
-
-        # Vectores que permiten búsqueda semántica
         embeddings=embeddings.tolist(),
-
-        # IDs únicos
-        # Sirven para identificar cada chunk internamente
         ids=[c["id"] for c in chunks],
-
-        # Metadata asociada a cada chunk
         metadatas=[
             {
-                "chunk_index": i,         # Orden del chunk
-                "start_index": c["start_index"],  # Posición en el texto original
-                "chunk_size": c["size"]   # Tamaño real del fragmento
+                "chunk_index": i,
+                "start_index": c["start_index"],
+                "chunk_size": c["size"]
             }
             for i, c in enumerate(chunks)
         ]
     )
-
-    # ------------------------------
-    # 6️⃣ Devolver colección lista
-    # ------------------------------
-    # La colección ya puede:
-    # - recibir queries (preguntas)
-    # - devolver chunks relevantes
     return collection
 
-
-
 def retrieve_context(collection, query, k=4):
-    """
-    Recupera los k chunks más similares a la pregunta.
-    Devuelve tanto el texto como la metadata asociada.
-    """
+    """Recupera los k chunks más similares."""
     query_embedding = EMBEDDING_MODEL.encode([query])
-
     results = collection.query(
         query_embeddings=query_embedding.tolist(),
         n_results=k
     )
-
     return results
 
-
 def ask_gemini(context, question):
-    """
-    Llama a Gemini usando el contexto recuperado.
-    El prompt fuerza comportamiento RAG (no inventar).
-    """
+    """Llama a Gemini usando el contexto."""
     model = genai.GenerativeModel("models/gemini-2.5-flash-lite")
-
     prompt = f"""
 Eres un asistente que responde SOLO con la información del contexto.
 Si la respuesta no está en el contexto, di: "No se encuentra en el documento".
@@ -237,7 +131,6 @@ Contexto:
 Pregunta:
 {question}
 """
-
     response = model.generate_content(prompt)
     return response.text
 
@@ -245,68 +138,76 @@ Pregunta:
 # INTERFAZ
 # ============================================================
 
-st.title("📄 Chat con PDF + ChromaDB + Gemini")
+st.title("📄 Chat con Documentos (PDF/Word)")
 
-uploaded_pdf = st.file_uploader("Sube un PDF", type="pdf")
+# AHORA ACEPTA PDF Y DOCX
+uploaded_file = st.file_uploader("Sube un archivo", type=["pdf", "docx"])
 
-# 🔄 Detectar cambio de PDF y resetear estado
-if uploaded_pdf:
-    current_hash = hash_pdf(uploaded_pdf)
+# 🔄 Detectar cambio de archivo y resetear estado
+if uploaded_file:
+    current_hash = hash_file(uploaded_file)
 
-    if st.session_state.pdf_hash != current_hash:
-        st.session_state.pdf_hash = current_hash
-        st.session_state.pdf_processed = False
+    if st.session_state.file_hash != current_hash:
+        st.session_state.file_hash = current_hash
+        st.session_state.file_processed = False
         st.session_state.collection = None
+        st.session_state.messages = [] # Limpiar chat al cambiar archivo
 
 # ------------------------------
-# BOTÓN PROCESAR PDF
+# BOTÓN PROCESAR
 # ------------------------------
-if uploaded_pdf and not st.session_state.pdf_processed:
-    if st.button("📥 Procesar PDF"):
-        with st.spinner("Procesando PDF..."):
-            text = extract_text_from_pdf(uploaded_pdf)
-            chunks = chunk_text(text)
-            st.session_state.collection = create_chroma_collection(chunks)
-            st.session_state.pdf_processed = True
+if uploaded_file and not st.session_state.file_processed:
+    if st.button("📥 Procesar Documento"):
+        with st.spinner("Procesando documento..."):
+            
+            # DETECTAR TIPO DE ARCHIVO
+            if uploaded_file.name.endswith('.pdf'):
+                text = extract_text_from_pdf(uploaded_file)
+            elif uploaded_file.name.endswith('.docx'):
+                text = extract_text_from_docx(uploaded_file)
+            else:
+                text = ""
+                st.error("Formato no soportado")
 
-        st.success(f"PDF procesado ✅ ({len(chunks)} fragmentos)")
+            if text:
+                chunks = chunk_text(text)
+                st.session_state.collection = create_chroma_collection(chunks)
+                st.session_state.file_processed = True
+                st.success(f"Documento procesado ✅ ({len(chunks)} fragmentos)")
 
 # ------------------------------
 # SECCIÓN DE PREGUNTAS
 # ------------------------------
-if st.session_state.pdf_processed and st.session_state.collection:
+if st.session_state.file_processed and st.session_state.collection:
     st.divider()
-    st.subheader("❓ Pregunta al documento")
+    
+    # Mostrar historial de chat
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            st.write(msg["content"])
 
-    question = st.text_input("Escribe tu pregunta")
+    # Input del usuario (Estilo chat moderno)
+    if prompt := st.chat_input("Escribe tu pregunta sobre el documento..."):
+        # 1. Mostrar pregunta usuario
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.write(prompt)
 
-    if st.button("🤖 Preguntar") and question:
-        with st.spinner("Buscando respuesta..."):
-            results = retrieve_context(st.session_state.collection, question)
-
-            # Unimos los documentos para Gemini
+        # 2. Procesar respuesta
+        with st.spinner("Pensando..."):
+            results = retrieve_context(st.session_state.collection, prompt)
             context_text = "\n\n".join(results["documents"][0])
+            answer = ask_gemini(context_text, prompt)
 
-            answer = ask_gemini(context_text, question)
-
-        st.subheader("🤖 Respuesta")
-        st.write(answer)
-
-        # ------------------------------
-        # DETALLE DEL CONTEXTO USADO
-        # ------------------------------
-        with st.expander("📚 Contexto usado (detallado)"):
-            for i, (doc, meta) in enumerate(
-                zip(results["documents"][0], results["metadatas"][0])
-            ):
-                st.markdown(f"""
-**Chunk #{meta['chunk_index']}**
-- 📍 Inicio en texto: `{meta['start_index']}`
-- 📏 Tamaño: `{meta['chunk_size']}` caracteres
-
-```text
-{doc}
-""")
+        # 3. Mostrar respuesta bot
+        st.session_state.messages.append({"role": "assistant", "content": answer})
+        with st.chat_message("assistant"):
+            st.write(answer)
+        
+        # 4. Mostrar contexto (opcional)
+        with st.expander("📚 Ver contexto usado"):
+            for doc in results["documents"][0]:
+                st.text(doc[:200] + "...")
 
 # ==========================================
 # PLUS: Barra lateral con herramientas
@@ -325,7 +226,7 @@ with st.sidebar:
         st.download_button(
             label="💾 Descargar Chat (.txt)",
             data=chat_str,
-            file_name="mi_chat_pdf.txt",
+            file_name="historial_chat.txt",
             mime="text/plain"
         )
 
@@ -333,4 +234,4 @@ with st.sidebar:
     if st.button("🗑️ Borrar Historial"):
         st.session_state.messages = []
         st.rerun()
-        
+    
