@@ -307,3 +307,30 @@ if st.session_state.pdf_processed and st.session_state.collection:
 ```text
 {doc}
 """)
+
+# ==========================================
+# PLUS: Barra lateral con herramientas
+# ==========================================
+with st.sidebar:
+    st.markdown("---")
+    st.header("🛠️ Herramientas Extra")
+    
+    # Botón 1: Descargar conversación
+    if "messages" in st.session_state and st.session_state.messages:
+        chat_str = ""
+        for msg in st.session_state.messages:
+            role = "🤖 Bot" if msg["role"] == "assistant" else "👤 Usuario"
+            chat_str += f"{role}: {msg['content']}\n\n"
+            
+        st.download_button(
+            label="💾 Descargar Chat (.txt)",
+            data=chat_str,
+            file_name="mi_chat_pdf.txt",
+            mime="text/plain"
+        )
+
+    # Botón 2: Limpiar memoria (Reset)
+    if st.button("🗑️ Borrar Historial"):
+        st.session_state.messages = []
+        st.rerun()
+        
